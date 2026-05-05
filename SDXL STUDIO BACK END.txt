@@ -1,0 +1,148 @@
+# ================= INSTALL =================
+!pip install -q diffusers transformers accelerate torch flask flask-cors pyngrok pillow safetensors
+
+# ================= IMPORTS =================
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import torch
+from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
+import base64
+from io import BytesIO
+from pyngrok import ngrok
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import gc
+
+# ================= NGROK =================
+ngrok.set_auth_token("3D28fgMvxvSHy5tBqOFiD6ludAK_52t3nmpevNaMvqwSnR1SD")
+
+try:
+    ngrok.kill()
+except:
+    pass
+
+# ================= APP =================
+app = Flask(__name__)
+CORS(app)
+
+# ================= DEVICE FIX =================
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = torch.float16 if device == "cuda" else torch.float32
+
+print("🔥 Running on:", device)
+
+# ================= MODEL =================
+model_id = "stabilityai/stable-diffusion-xl-base-1.0"
+
+pipe = StableDiffusionXLPipeline.from_pretrained(
+    model_id,
+    torch_dtype=dtype,
+    variant="fp16" if device == "cuda" else None,
+    use_safetensors=True
+)
+
+pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+pipe = pipe.to(device)
+
+# memory optimization
+pipe.enable_attention_slicing()
+pipe.vae.enable_slicing()
+
+DEFAULT_NEGATIVE = "extra people, blurry, low quality, deformed, duplicate, cropped"
+
+# ================= GPT =================
+tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
+gpt_model = AutoModelForCausalLM.from_pretrained("distilgpt2")
+gpt_model.eval()
+
+# =====================================================
+# IMAGE API
+# =====================================================
+@app.route("/api/generate", methods=["POST"])
+def generate():
+    try:
+        data = request.get_json(force=True)
+
+        prompt = data.get("prompt","").strip()
+
+        if not prompt:
+            return jsonify({"error":"Empty prompt"}),400
+
+        with torch.no_grad():
+
+            image = pipe(
+                prompt=prompt,
+                negative_prompt=DEFAULT_NEGATIVE,
+                num_inference_steps=20,
+                guidance_scale=7.5,
+                width=1024,
+                height=1024
+            ).images[0]
+
+        buffered = BytesIO()
+        image.save(buffered, format="PNG")
+
+        img_base64 = base64.b64encode(buffered.getvalue()).decode()
+
+        # cleanup
+        del image
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        return jsonify({"image": img_base64})
+
+    except Exception as e:
+        print("❌ ERROR:", str(e))
+        return jsonify({"error": str(e)}), 500
+
+
+# =====================================================
+# RECOMMEND API
+# =====================================================
+@app.route("/api/recommend", methods=["POST"])
+def recommend():
+    try:
+        data = request.get_json(force=True)
+
+        prompt = data.get("prompt","").strip()
+
+        if not prompt:
+            return jsonify({"recommendations":[]})
+
+        inputs = tokenizer(prompt, return_tensors="pt")
+
+        with torch.no_grad():
+            outputs = gpt_model.generate(
+                **inputs,
+                max_new_tokens=3,
+                num_return_sequences=10,
+                do_sample=True,
+                top_k=50,
+                top_p=0.95,
+                temperature=0.9
+            )
+
+        suggestions = []
+
+        for output in outputs:
+            text = tokenizer.decode(output, skip_special_tokens=True)
+
+            if text.lower().startswith(prompt.lower()):
+                remainder = text[len(prompt):].strip()
+
+                if remainder:
+                    next_word = remainder.split(" ")[0]
+                    suggestions.append(prompt + " " + next_word)
+
+        suggestions = list(dict.fromkeys(suggestions))
+
+        return jsonify({"recommendations": suggestions[:5]})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ================= RUN =================
+public_url = ngrok.connect(5000)
+print("🔥 NGROK URL:", public_url)
+app.run(host="0.0.0.0", port=5000)
